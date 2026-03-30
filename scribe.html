@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>ABC Notation → Staff + MIDI</title>
+
+    <style>
+        body {
+            background: #111;
+            color: #eee;
+            font-family: system-ui, sans-serif;
+            padding: 20px;
+        }
+
+        #app {
+            max-width: 1200px;
+            margin: auto;
+        }
+
+        textarea,
+        input {
+            width: 100%;
+            background: #1c1c1c;
+            color: #eee;
+            border: 1px solid #444;
+            padding: 6px;
+            font-family: monospace;
+        }
+
+        textarea {
+            height: 160px;
+        }
+
+        button {
+            margin-top: 8px;
+            padding: 8px 12px;
+            background: #333;
+            color: #eee;
+            border: 1px solid #555;
+            cursor: pointer;
+        }
+
+        canvas {
+            background: #fff;
+            display: block;
+            margin: 12px auto;
+        }
+
+        .nav {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="app">
+
+        <h2>ABC Notation → Treble Staff</h2>
+
+        <label>BPM</label>
+        <input id="bpm" type="number" value="120">
+
+        <label>ABC</label>
+        <textarea id="abc">
+X:1
+L:1/4
+K:C
+c'1 ^c'1 g'1 g'1 a'1 a'1 g'1 f'1 e'2 d'2 b1 c'1 g'1 ^f'1 f'1
+f'1 e'2 d'1 g'1 ^f'1 f'2 e'1 e'1 d'2 c'2 a'1 ^a'1 a'1
+g'1 g'1 f'1 f'1 e'1 e'1 d'2
+</textarea>
+
+        <button onclick="render()">Draw</button>
+        <button onclick="exportMIDI()">Export MIDI</button>
+
+        <canvas id="score" width="1100" height="420"></canvas>
+
+        <div class="nav">
+            <button onclick="prevPage()">◀ Previous</button>
+            <div id="pageInfo"></div>
+            <button onclick="nextPage()">Next ▶</button>
+        </div>
+
+    </div>
+
+    <script>
+        const canvas = document.getElementById("score");
+        const ctx = canvas.getContext("2d");
+
+        const STAFF_TOP = 80;
+        const STAFF_SPACING = 12;
+        const LEFT_MARGIN = 60;
+        const RIGHT_MARGIN = canvas.width - 40;
+
+        let pages = [];
+        let currentPage = 0;
+        let tokens = [];
+
+        /* ===================== PARSER ===================== */
+
+        function parseABC(text) {
+            let defaultLength = 1; // beats
+            const out = [];
+
+            for (let line of text.split("\n")) {
+                line = line.trim();
+                if (!line) continue;
+
+                if (line.startsWith("L:")) {
+                    const m = line.match(/L:(\d+)\/(\d+)/);
+                    if (m) defaultLength = (m[1] / m[2]) * 4;
+                    continue;
+                }
+                if (/^[A-Z]:/.test(line)) continue;
+
+                for (let part of line.split(/\s+/)) {
+                    if (part === "|") continue;
+
+                    const m = part.match(/^([\^_=]*)([A-Ga-g])([',]*)(\d+)?$/);
+                    if (!m) continue;
+
+                    out.push({
+                        type: "note",
+                        pitch: m[2],
+                        accidental: m[1] || "",
+                        octaveMarks: m[3] || "",
+                        duration: defaultLength * (m[4] ? +m[4] : 1)
+                    });
+                }
+            }
+            return out;
+        }
+
+        /* ===================== PITCH ===================== */
+
+        function pitchToStaffY(note, octaveMarks) {
+            const stepsMap = { C: 0, D: 1, E: 2, F: 3, G: 4, A: 5, B: 6 };
+            let steps = stepsMap[note.toUpperCase()];
+            if (note === note.toLowerCase()) steps += 7;
+            for (let o of octaveMarks) steps += (o === "'" ? 7 : o === "," ? -7 : 0);
+            return STAFF_TOP + STAFF_SPACING * 4 - steps * (STAFF_SPACING / 2);
+        }
+
+        function pitchToMidi(note, accidental, octaveMarks) {
+            const base = { C: 60, D: 62, E: 64, F: 65, G: 67, A: 69, B: 71 };
+            let m = base[note.toUpperCase()];
+            if (note === note.toLowerCase()) m += 12;
+            for (let o of octaveMarks) m += (o === "'" ? 12 : o === "," ? -12 : 0);
+            for (let a of accidental) m += (a === "^" ? 1 : a === "_" ? -1 : 0);
+            return m;
+        }
+
+        /* ===================== DRAWING ===================== */
+
+        function drawStaff() {
+            ctx.strokeStyle = "#000";
+            for (let i = 0; i < 5; i++) {
+                const y = STAFF_TOP + i * STAFF_SPACING;
+                ctx.beginPath();
+                ctx.moveTo(LEFT_MARGIN - 30, y);
+                ctx.lineTo(RIGHT_MARGIN, y);
+                ctx.stroke();
+            }
+            ctx.font = "48px serif";
+            ctx.fillText("𝄞", LEFT_MARGIN - 50, STAFF_TOP + STAFF_SPACING * 4);
+        }
+
+        function drawLedger(x, y) {
+            const top = STAFF_TOP;
+            const bottom = STAFF_TOP + STAFF_SPACING * 4;
+            for (let ly = top - STAFF_SPACING; y < ly; ly -= STAFF_SPACING) {
+                ctx.beginPath();
+                ctx.moveTo(x - 10, ly);
+                ctx.lineTo(x + 10, ly);
+                ctx.stroke();
+            }
+            for (let ly = bottom + STAFF_SPACING; y > ly; ly += STAFF_SPACING) {
+                ctx.beginPath();
+                ctx.moveTo(x - 10, ly);
+                ctx.lineTo(x + 10, ly);
+                ctx.stroke();
+            }
+        }
+
+        function drawNote(x, y, beats) {
+            let type = beats <= 0.5 ? "eighth" :
+                beats === 1 ? "quarter" :
+                    beats === 2 ? "half" : "whole";
+
+            const up = y > STAFF_TOP + STAFF_SPACING * 2;
+            ctx.beginPath();
+            ctx.ellipse(x, y, 6, 4, -0.3, 0, Math.PI * 2);
+            (type === "half" || type === "whole") ? ctx.stroke() : ctx.fill();
+
+            if (type !== "whole") {
+                ctx.beginPath();
+                ctx.moveTo(x + (up ? 6 : -6), y);
+                ctx.lineTo(x + (up ? 6 : -6), y + (up ? -30 : 30));
+                ctx.stroke();
+            }
+
+            if (type === "eighth") {
+                ctx.beginPath();
+                ctx.moveTo(x + (up ? 6 : -6), y + (up ? -30 : 30));
+                ctx.quadraticCurveTo(x + (up ? 14 : -14), y - 20, x + (up ? 10 : -10), y - 12);
+                ctx.stroke();
+            }
+        }
+
+        /* ===================== PAGINATION ===================== */
+
+        function layoutPages(tokens) {
+            pages = [];
+            let page = [];
+            let x = LEFT_MARGIN + 20;
+            const pxPerBeat = 40;
+
+            for (let t of tokens) {
+                const w = t.duration * pxPerBeat;
+                if (x + w > RIGHT_MARGIN) {
+                    pages.push(page);
+                    page = [];
+                    x = LEFT_MARGIN + 20;
+                }
+                page.push({ ...t, x });
+                x += w;
+            }
+            if (page.length) pages.push(page);
+        }
+
+        /* ===================== MAIN ===================== */
+
+        function render() {
+            tokens = parseABC(document.getElementById("abc").value);
+            layoutPages(tokens);
+            currentPage = 0;
+            showPage();
+        }
+
+        function showPage() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            drawStaff();
+
+            for (let t of pages[currentPage]) {
+                const y = pitchToStaffY(t.pitch, t.octaveMarks);
+                drawLedger(t.x, y);
+                drawNote(t.x, y, t.duration);
+            }
+
+            document.getElementById("pageInfo").textContent =
+                `Page ${currentPage + 1} of ${pages.length}`;
+        }
+
+        function nextPage() {
+            if (currentPage < pages.length - 1) {
+                currentPage++;
+                showPage();
+            }
+        }
+
+        function prevPage() {
+            if (currentPage > 0) {
+                currentPage--;
+                showPage();
+            }
+        }
+
+        /* ===================== MIDI ===================== */
+
+        function writeVar(v) {
+            let b = [];
+            let x = v & 0x7F;
+            while ((v >>= 7)) {
+                x <<= 8;
+                x |= ((v & 0x7F) | 0x80);
+            }
+            while (true) {
+                b.push(x & 0xFF);
+                if (x & 0x80) x >>= 8;
+                else break;
+            }
+            return b;
+        }
+
+        function exportMIDI() {
+            const bpm = +document.getElementById("bpm").value;
+            const tpq = 480;
+            let track = [];
+            const mpqn = Math.round(60000000 / bpm);
+            track.push(0, 0xFF, 0x51, 3, mpqn >> 16, mpqn >> 8, mpqn & 255);
+
+            for (let t of tokens) {
+                const dur = Math.round(t.duration * tpq);
+                const n = pitchToMidi(t.pitch, t.accidental, t.octaveMarks);
+                track.push(...writeVar(0), 0x90, n, 100);
+                track.push(...writeVar(dur), 0x80, n, 0);
+            }
+
+            track.push(0, 0xFF, 0x2F, 0);
+
+            const data = new Uint8Array([
+                77, 84, 104, 100, 0, 0, 0, 6, 0, 0, 0, 1, tpq >> 8, tpq & 255,
+                77, 84, 114, 107,
+                track.length >> 24, track.length >> 16, track.length >> 8, track.length & 255,
+                ...track
+            ]);
+
+            const a = document.createElement("a");
+            a.href = URL.createObjectURL(new Blob([data], { type: "audio/midi" }));
+            a.download = "score.mid";
+            a.click();
+        }
+    </script>
+</body>
+
+</html>
